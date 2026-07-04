@@ -166,6 +166,10 @@ main { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
 .chat-row { display: flex; gap: 10px; }
 .chat-row textarea { resize: none; height: 52px; }
 .chat-row button { margin: 0; white-space: nowrap; }
+#mic-btn { background: var(--panel2); border: 1px solid var(--line); font-size: 18px; }
+#mic-btn.listening { background: var(--err); animation: pulse 1.2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) { #mic-btn.listening { animation: none; } }
 .hint { color: var(--dim); font-size: 13px; margin-top: 10px; }
 details summary { cursor: pointer; color: var(--dim); font-size: 14px; }
 </style>
@@ -206,7 +210,14 @@ Try: "Build me a dashboard for my living room lights and thermostat."</div>
   </div>
   <div class="chat-row">
     <textarea id="chat-input" placeholder="Describe what you want..."></textarea>
+    <button onclick="toggleVoice()" id="mic-btn" title="Speak instead of typing">&#127908;</button>
     <button onclick="sendMsg()" id="send-btn">Send</button>
+  </div>
+  <div class="hint">
+    <label style="display:inline;cursor:pointer;">
+      <input type="checkbox" id="voice-mode" style="width:auto;vertical-align:middle;" onchange="voiceModeChanged()">
+      Voice chat &mdash; I'll talk back and keep listening, hands-free
+    </label>
   </div>
 </main>
 
@@ -234,6 +245,7 @@ async function sendMsg() {
   const btn = document.getElementById('send-btn');
   const text = input.value.trim();
   if (!text) return;
+  if (window.speechSynthesis) speechSynthesis.cancel();
   addMsg(text, 'user');
   history.push({role: 'user', content: text});
   input.value = '';
@@ -251,6 +263,7 @@ async function sendMsg() {
     } else {
       addMsg(data.response, 'claude');
       history.push({role: 'assistant', content: data.response});
+      speak(data.response);
     }
   } catch (e) {
     addMsg('Network error: ' + e.message, 'claude');
@@ -262,6 +275,67 @@ async function sendMsg() {
 document.getElementById('chat-input').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
 });
+
+// --- Voice input (browser speech recognition, free) ---
+let recog = null, listening = false;
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (!SR) {
+  const mb = document.getElementById('mic-btn');
+  mb.disabled = true;
+  mb.title = 'Voice input needs Chrome or Edge';
+}
+
+function toggleVoice() {
+  const mb = document.getElementById('mic-btn');
+  const input = document.getElementById('chat-input');
+  if (listening) { recog.stop(); return; }
+  recog = new SR();
+  recog.lang = 'en-US';
+  recog.interimResults = true;
+  recog.continuous = false;
+  const before = input.value ? input.value + ' ' : '';
+  recog.onresult = e => {
+    let text = '';
+    for (const r of e.results) text += r[0].transcript;
+    input.value = before + text;
+  };
+  recog.onstart = () => { listening = true; mb.classList.add('listening'); };
+  recog.onend = () => {
+    listening = false; mb.classList.remove('listening');
+    if (input.value.trim()) sendMsg();
+  };
+  recog.onerror = e => {
+    listening = false; mb.classList.remove('listening');
+    if (e.error === 'not-allowed') alert('Allow microphone access in your browser to use voice.');
+  };
+  recog.start();
+}
+
+// --- Voice chat (text-to-speech + hands-free loop) ---
+function voiceOn() { return document.getElementById('voice-mode').checked; }
+
+function voiceModeChanged() {
+  if (!voiceOn()) { speechSynthesis.cancel(); if (listening && recog) recog.stop(); }
+}
+
+function speak(text) {
+  if (!voiceOn() || !window.speechSynthesis) return;
+  // Don't read code blocks aloud; mention them instead.
+  const spoken = text
+    .split(/```[\\s\\S]*?```/).join(' ... the config is in the chat ... ')
+    .replace(/[*#`_]/g, '')
+    .replace(/\\[Actions taken:.*?\\]/g, '')
+    .trim();
+  if (!spoken) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(spoken.slice(0, 1200));
+  u.rate = 1.05;
+  u.onend = () => {
+    // Hands-free: after speaking, listen for the user's next request.
+    if (voiceOn() && SR && !listening) toggleVoice();
+  };
+  speechSynthesis.speak(u);
+}
 
 async function saveHA() {
   const msg = document.getElementById('setup-msg');
@@ -378,18 +452,116 @@ def setup_ha():
 
 
 SYSTEM_PROMPT = """You are an expert Home Assistant assistant for everyday users \
-who don't know YAML. When the user describes what they want:
+who don't know YAML. You are connected to the user's real Home Assistant instance.
 
-1. Ask at most one clarifying question if truly needed; otherwise just build it.
-2. Generate valid, complete YAML for dashboards (Lovelace), automations, or blueprints.
-3. Wrap all YAML in ```yaml fences.
-4. After the YAML, give short numbered steps for pasting it into Home Assistant \
-(Settings > Dashboards > Raw configuration editor for dashboards; \
-Settings > Automations > Create > Edit in YAML for automations).
+You have tools to list their real entities, read states, and create automations \
+directly on their system. Use them:
+- ALWAYS call list_entities before writing any config, so you use their real \
+entity IDs instead of placeholders.
+- When the user asks for an automation, build it and deploy it with \
+create_automation, then confirm what you created in plain English.
+- Dashboards can't be deployed automatically yet: generate the dashboard YAML \
+in a ```yaml fence and give short numbered steps \
+(Settings > Dashboards > pencil icon > three-dot menu > Raw configuration editor).
 
-Keep the tone friendly and plain-English. Never assume entity IDs \
-the user hasn't given you; use obvious placeholders like light.living_room \
-and tell the user to swap in their real entity names."""
+Keep the tone friendly and plain-English. Confirm before creating anything \
+destructive or that replaces an existing automation."""
+
+HA_TOOLS = [
+    {
+        "name": "list_entities",
+        "description": ("List the user's Home Assistant entities. Returns entity_id, "
+                        "friendly name, and current state. Optionally filter by domain "
+                        "(e.g. 'light', 'sensor', 'switch', 'climate') or a search word."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Optional domain filter, e.g. 'light'"},
+                "search": {"type": "string", "description": "Optional keyword to match in entity id or name"},
+            },
+        },
+    },
+    {
+        "name": "get_state",
+        "description": "Get the full state and attributes of one entity by entity_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"entity_id": {"type": "string"}},
+            "required": ["entity_id"],
+        },
+    },
+    {
+        "name": "create_automation",
+        "description": ("Create (or overwrite) an automation on the user's Home Assistant. "
+                        "Provide a unique snake_case automation_id and the automation config "
+                        "as JSON with alias, trigger, condition (optional), and action."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "automation_id": {"type": "string", "description": "snake_case id, e.g. 'garage_lights_on_arrival'"},
+                "config": {"type": "object", "description": "Automation config: alias, description, trigger, condition, action, mode"},
+            },
+            "required": ["automation_id", "config"],
+        },
+    },
+]
+
+
+def _ha_headers(user):
+    return {"Authorization": f"Bearer {user.ha_token}", "Content-Type": "application/json"}
+
+
+def run_ha_tool(user, name, tool_input):
+    """Execute a tool call against the user's Home Assistant. Returns a string result."""
+    base = user.ha_url
+    try:
+        if name == "list_entities":
+            r = requests.get(f"{base}/api/states", headers=_ha_headers(user), timeout=10)
+            r.raise_for_status()
+            states = r.json()
+            domain = (tool_input.get("domain") or "").lower().strip()
+            search = (tool_input.get("search") or "").lower().strip()
+            rows = []
+            for s in states:
+                eid = s.get("entity_id", "")
+                fname = (s.get("attributes") or {}).get("friendly_name", "")
+                if domain and not eid.startswith(domain + "."):
+                    continue
+                if search and search not in eid.lower() and search not in fname.lower():
+                    continue
+                rows.append(f"{eid} | {fname} | {s.get('state')}")
+            if not rows:
+                return "No matching entities found."
+            return "\n".join(rows[:400])
+
+        if name == "get_state":
+            eid = tool_input.get("entity_id", "")
+            r = requests.get(f"{base}/api/states/{eid}", headers=_ha_headers(user), timeout=10)
+            if r.status_code == 404:
+                return f"Entity {eid} not found."
+            r.raise_for_status()
+            return str(r.json())
+
+        if name == "create_automation":
+            aid = tool_input.get("automation_id", "").strip()
+            config = tool_input.get("config") or {}
+            if not aid or not config:
+                return "Error: automation_id and config are both required."
+            config.setdefault("alias", aid.replace("_", " ").title())
+            r = requests.post(f"{base}/api/config/automation/config/{aid}",
+                              headers=_ha_headers(user), json=config, timeout=15)
+            if r.status_code in (200, 201):
+                # Reload automations so it takes effect immediately.
+                requests.post(f"{base}/api/services/automation/reload",
+                              headers=_ha_headers(user), timeout=10)
+                return f"Automation '{aid}' created and loaded successfully."
+            return (f"Home Assistant rejected it (HTTP {r.status_code}): {r.text[:300]}. "
+                    "Note: this requires the config integration (enabled by default "
+                    "unless the user runs YAML-only automations).")
+
+        return f"Unknown tool: {name}"
+    except requests.exceptions.RequestException as e:
+        return f"Could not reach Home Assistant: {e}"
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -402,14 +574,39 @@ def chat():
         return jsonify({"error": "Empty message."})
     try:
         client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        resp = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=messages[-20:],  # keep the last 20 turns for context
-        )
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        return jsonify({"response": text})
+        convo = list(messages[-20:])  # keep the last 20 turns for context
+        actions = []
+
+        for _ in range(6):  # allow up to 6 tool round-trips per user message
+            resp = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2500,
+                system=SYSTEM_PROMPT,
+                tools=HA_TOOLS,
+                messages=convo,
+            )
+            if resp.stop_reason != "tool_use":
+                text = "".join(b.text for b in resp.content if b.type == "text")
+                if actions:
+                    text += "\n\n[Actions taken: " + "; ".join(actions) + "]"
+                return jsonify({"response": text})
+
+            # Execute every tool call in this turn, then continue the loop.
+            convo.append({"role": "assistant", "content": resp.content})
+            results = []
+            for block in resp.content:
+                if block.type == "tool_use":
+                    result = run_ha_tool(current_user, block.name, block.input or {})
+                    if block.name == "create_automation" and "successfully" in result:
+                        actions.append(f"created automation '{(block.input or {}).get('automation_id')}'")
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+            convo.append({"role": "user", "content": results})
+
+        return jsonify({"response": "That took too many steps — try breaking the request into smaller pieces."})
     except Exception as e:
         return jsonify({"error": str(e)})
 

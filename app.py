@@ -1,5 +1,6 @@
 import os
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 
 import anthropic
 import requests
@@ -33,6 +34,14 @@ class User(UserMixin, db.Model):
     ha_url = db.Column(db.String(255))
     ha_token = db.Column(db.String(500))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class PasswordReset(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+    token = db.Column(db.String(64), unique=True, nullable=False)
+    expires = db.Column(db.DateTime, nullable=False)
+    used = db.Column(db.Boolean, default=False)
 
 
 @login_manager.user_loader
@@ -120,6 +129,7 @@ body { display: flex; align-items: center; justify-content: center; }
   <div class="swap">
     {% if is_login %}
       No account yet? <a href="{{ url_for('signup') }}">Sign up</a>
+      &nbsp;&middot;&nbsp; <a href="{{ url_for('forgot') }}">Forgot password?</a>
     {% else %}
       Already registered? <a href="{{ url_for('login') }}">Log in</a>
     {% endif %}
@@ -416,6 +426,119 @@ def signup():
 def logout():
     logout_user()
     return redirect(url_for("login"))
+
+
+# ------------------------------------------------------------ password reset
+
+RESET_REQUEST_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reset password — HA Assistant</title>
+<style>""" + BASE_CSS + """
+body { display: flex; align-items: center; justify-content: center; }
+.card { width: 100%; max-width: 380px; }
+</style></head>
+<body>
+<div class="card">
+  <h1>{{ 'Set a new password' if token else 'Reset your password' }}</h1>
+  <div class="sub">{{ 'Choose a new password for your account.' if token
+      else "Enter your account email and we'll send you a reset link." }}</div>
+  <form method="POST">
+    {% if token %}
+      <label for="password">New password</label>
+      <input id="password" name="password" type="password" required autocomplete="new-password">
+      <label for="confirm">Confirm new password</label>
+      <input id="confirm" name="confirm" type="password" required autocomplete="new-password">
+    {% else %}
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" required autocomplete="email">
+    {% endif %}
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    {% if message %}<div class="ok">{{ message }}</div>{% endif %}
+    <button type="submit">{{ 'Save new password' if token else 'Send reset link' }}</button>
+  </form>
+  <div style="margin-top:18px;font-size:14px;"><a href="{{ url_for('login') }}">Back to log in</a></div>
+</div>
+</body></html>
+"""
+
+
+def send_reset_email(to_email, reset_link):
+    """Send the reset link via SendGrid. Returns True on success."""
+    api_key = os.getenv("SENDGRID_API_KEY")
+    from_email = os.getenv("FROM_EMAIL")
+    if not api_key or not from_email:
+        app.logger.error("SENDGRID_API_KEY or FROM_EMAIL not set")
+        return False
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": from_email, "name": "HA Assistant"},
+        "subject": "Reset your HA Assistant password",
+        "content": [{
+            "type": "text/plain",
+            "value": ("Someone (hopefully you) asked to reset your HA Assistant "
+                      f"password.\n\nReset it here (link is good for 1 hour):\n{reset_link}\n\n"
+                      "If you didn't ask for this, ignore this email."),
+        }],
+    }
+    try:
+        r = requests.post("https://api.sendgrid.com/v3/mail/send",
+                          headers={"Authorization": f"Bearer {api_key}",
+                                   "Content-Type": "application/json"},
+                          json=payload, timeout=10)
+        if r.status_code == 202:
+            return True
+        app.logger.error("SendGrid error %s: %s", r.status_code, r.text[:300])
+        return False
+    except requests.exceptions.RequestException as e:
+        app.logger.error("SendGrid request failed: %s", e)
+        return False
+
+
+@app.route("/forgot", methods=["GET", "POST"])
+def forgot():
+    message = error = None
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        user = User.query.filter(db.func.lower(User.email) == email).first()
+        if user:
+            token = secrets.token_urlsafe(32)
+            db.session.add(PasswordReset(user_id=user.id, token=token,
+                                         expires=datetime.utcnow() + timedelta(hours=1)))
+            db.session.commit()
+            link = request.host_url.rstrip("/") + url_for("reset_password", token=token)
+            if not send_reset_email(user.email, link):
+                error = "Couldn't send the email right now. Try again in a few minutes."
+        if not error:
+            # Same message whether or not the account exists (don't leak emails).
+            message = "If that email has an account, a reset link is on its way."
+    return render_template_string(RESET_REQUEST_TEMPLATE, token=None,
+                                  message=message, error=error)
+
+
+@app.route("/reset/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    pr = PasswordReset.query.filter_by(token=token, used=False).first()
+    if not pr or pr.expires < datetime.utcnow():
+        return render_template_string(RESET_REQUEST_TEMPLATE, token=None, message=None,
+                                      error="That reset link is expired or already used. Request a new one.")
+    error = None
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        if password != request.form.get("confirm", ""):
+            error = "Passwords do not match."
+        elif len(password) < 8:
+            error = "Password must be at least 8 characters."
+        else:
+            user = db.session.get(User, pr.user_id)
+            user.password = generate_password_hash(password)
+            pr.used = True
+            db.session.commit()
+            login_user(user)
+            return redirect(url_for("dashboard"))
+    return render_template_string(RESET_REQUEST_TEMPLATE, token=token,
+                                  message=None, error=error)
 
 
 @app.route("/dashboard")

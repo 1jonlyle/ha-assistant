@@ -428,11 +428,102 @@ async function saveHA() {
 
 # ------------------------------------------------------------------- routes
 
+LANDING_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HouseAssist — Home Assistant setup, in plain English</title>
+<meta name="description" content="Describe what you want your smart home to do — by voice or text — and HouseAssist configures Home Assistant for you. No YAML.">
+<style>""" + BASE_CSS + """
+main { max-width: 760px; margin: 0 auto; padding: 48px 20px 80px; }
+.hero { text-align: center; padding: 40px 0 30px; }
+.hero .brand { color: var(--accent); font-weight: 700; letter-spacing: 2px;
+  font-size: 14px; text-transform: uppercase; }
+.hero h1 { font-size: 40px; line-height: 1.15; margin: 18px 0 14px; }
+.hero p { color: var(--dim); font-size: 19px; line-height: 1.5; max-width: 560px; margin: 0 auto; }
+.cta { margin-top: 30px; }
+.cta a.primary { display: inline-block; background: var(--accent); color: #14171c;
+  font-weight: 700; font-size: 17px; padding: 14px 30px; border-radius: 8px; }
+.cta a.primary:hover { background: var(--accent-dark); }
+.cta a.secondary { display: inline-block; margin-left: 14px; color: var(--dim);
+  font-size: 16px; padding: 14px 8px; }
+.beta { display: inline-block; margin-top: 16px; font-size: 13px; color: var(--ok);
+  background: rgba(93,211,158,.12); padding: 4px 12px; border-radius: 20px; }
+.examples { margin: 50px 0; }
+.examples .say { background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 16px 20px; margin-bottom: 12px; font-size: 17px; }
+.examples .say::before { content: "\\1F399  "; }
+h2 { font-size: 22px; margin: 50px 0 18px; }
+.steps { counter-reset: step; }
+.step { display: flex; gap: 16px; margin-bottom: 22px; align-items: flex-start; }
+.step .n { counter-increment: step; background: var(--panel2); border: 1px solid var(--line);
+  color: var(--accent); font-weight: 700; border-radius: 50%; width: 34px; height: 34px;
+  flex-shrink: 0; display: flex; align-items: center; justify-content: center; }
+.step .n::before { content: counter(step); }
+.step p { color: var(--dim); line-height: 1.55; margin-top: 5px; }
+.step b { color: var(--text); display: block; font-size: 16px; }
+.fine { color: var(--dim); font-size: 14px; line-height: 1.6; border-top: 1px solid var(--line);
+  padding-top: 24px; margin-top: 56px; }
+footer { text-align: center; color: var(--dim); font-size: 13px; padding: 30px 0 10px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="hero">
+    <div class="brand">HouseAssist</div>
+    <h1>Your smart home, set up<br>in plain English.</h1>
+    <p>Home Assistant is powerful — and a pain to configure. Tell HouseAssist what
+    you want, by voice or text, and it builds and deploys the automations for you.
+    No YAML. No forums. No giving up.</p>
+    <div class="cta">
+      <a class="primary" href="/signup">Try it free</a>
+      <a class="secondary" href="/login">Log in</a>
+    </div>
+    <div class="beta">Free while in beta</div>
+  </div>
+
+  <div class="examples">
+    <div class="say">"Turn my garage lights on when I get home after sunset."</div>
+    <div class="say">"Build me a dashboard for my solar setup."</div>
+    <div class="say">"Notify me if the sump pump sensor goes offline."</div>
+  </div>
+
+  <h2>How it works</h2>
+  <div class="steps">
+    <div class="step"><div class="n"></div><p><b>Connect your Home Assistant</b>
+      Paste your instance URL and a long-lived access token. Takes about a minute.</p></div>
+    <div class="step"><div class="n"></div><p><b>Say what you want</b>
+      Type it or use hands-free voice chat. HouseAssist reads your real devices,
+      so it works with your actual setup — not generic placeholders.</p></div>
+    <div class="step"><div class="n"></div><p><b>It's live</b>
+      Automations deploy directly to your Home Assistant and work immediately.
+      Dashboards come back ready to paste, with instructions.</p></div>
+  </div>
+
+  <h2>What you'll need</h2>
+  <p style="color:var(--dim);line-height:1.6;">A Home Assistant instance reachable
+  from the internet (a Nabu Casa remote URL, DuckDNS, or your own reverse proxy) and a
+  long-lived access token from your HA profile page. That's it.</p>
+
+  <div class="fine">
+    Your Home Assistant token is encrypted at rest. No ads, no selling data.
+    Built by one person — expect the occasional rough edge during beta, and
+    please report anything that breaks.
+  </div>
+  <footer>&copy; 2026 HouseAssist &middot; houseassist.app</footer>
+</main>
+</body>
+</html>
+"""
+
+
 @app.route("/")
 def index():
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
-    return redirect(url_for("login"))
+    return render_template_string(LANDING_TEMPLATE)
 
 
 @app.route("/login", methods=["GET", "POST"])

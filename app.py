@@ -1,17 +1,59 @@
+import logging
 import os
 import secrets
 from datetime import datetime, timedelta
 
 import anthropic
 import requests
+from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 from flask_login import (LoginManager, UserMixin, current_user, login_required,
                          login_user, logout_user)
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 from werkzeug.security import check_password_hash, generate_password_hash
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-key-change-me")
+
+# --- SECRET_KEY: required in production, ephemeral fallback only in debug ---
+_secret = os.getenv("SECRET_KEY")
+_debug_mode = os.getenv("DEBUG") == "1" or os.getenv("FLASK_ENV") == "development"
+if not _secret:
+    if _debug_mode:
+        _secret = secrets.token_hex(32)
+        logging.warning("SECRET_KEY not set; using an ephemeral key because DEBUG=1. "
+                        "Sessions will NOT survive a restart.")
+    else:
+        raise RuntimeError("SECRET_KEY environment variable is required in production. "
+                           "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\"")
+app.config["SECRET_KEY"] = _secret
+
+# --- Token encryption at rest: Fernet key is mandatory, no silent fallback ---
+_enc_key = os.getenv("TOKEN_ENC_KEY")
+if not _enc_key:
+    raise RuntimeError("TOKEN_ENC_KEY environment variable is required (base64 Fernet key). "
+                       "Generate one with: python -c \"from cryptography.fernet import Fernet; "
+                       "print(Fernet.generate_key().decode())\"")
+try:
+    _fernet = Fernet(_enc_key.encode())
+except Exception as e:
+    raise RuntimeError(f"TOKEN_ENC_KEY is not a valid Fernet key: {e}")
+
+
+def encrypt_token(plaintext: str) -> str:
+    """Encrypt a Home Assistant token for storage."""
+    return _fernet.encrypt(plaintext.encode()).decode()
+
+
+def decrypt_token(ciphertext: str) -> str:
+    """Decrypt a stored HA token. Legacy plaintext rows (pre-encryption) are
+    returned unchanged; they get re-encrypted the next time the user saves."""
+    if not ciphertext:
+        return ciphertext
+    try:
+        return _fernet.decrypt(ciphertext.encode()).decode()
+    except InvalidToken:
+        return ciphertext
 
 # Railway provides DATABASE_URL for Postgres; fall back to SQLite locally.
 db_url = os.getenv("DATABASE_URL", "sqlite:///ha_assistant.db")
@@ -32,7 +74,7 @@ class User(UserMixin, db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password = db.Column(db.String(255), nullable=False)
     ha_url = db.Column(db.String(255))
-    ha_token = db.Column(db.String(500))
+    ha_token = db.Column(db.String(1000))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
@@ -51,6 +93,13 @@ def load_user(user_id):
 
 with app.app_context():
     db.create_all()
+    # Existing deployments created ha_token as VARCHAR(500); widen it for
+    # encrypted values. Harmless no-op where unsupported (e.g. SQLite).
+    try:
+        db.session.execute(text('ALTER TABLE "user" ALTER COLUMN ha_token TYPE VARCHAR(1000)'))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 
 # ---------------------------------------------------------------- templates
@@ -565,7 +614,7 @@ def setup_ha():
                          headers={"Authorization": f"Bearer {ha_token}"}, timeout=8)
         if r.status_code == 200:
             current_user.ha_url = ha_url
-            current_user.ha_token = ha_token
+            current_user.ha_token = encrypt_token(ha_token)
             db.session.commit()
             return jsonify({"success": True})
         return jsonify({"success": False,
@@ -631,7 +680,8 @@ HA_TOOLS = [
 
 
 def _ha_headers(user):
-    return {"Authorization": f"Bearer {user.ha_token}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {decrypt_token(user.ha_token)}",
+            "Content-Type": "application/json"}
 
 
 def run_ha_tool(user, name, tool_input):

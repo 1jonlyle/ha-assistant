@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import secrets
@@ -717,15 +718,27 @@ def setup_ha():
 SYSTEM_PROMPT = """You are an expert Home Assistant assistant for everyday users \
 who don't know YAML. You are connected to the user's real Home Assistant instance.
 
-You have tools to list their real entities, read states, and create automations \
-directly on their system. Use them:
+You have tools to list their real entities, read states, call services, and create \
+automations directly on their system. Use them:
 - ALWAYS call list_entities before writing any config, so you use their real \
 entity IDs instead of placeholders.
 - When the user asks for an automation, build it and deploy it with \
 create_automation, then confirm what you created in plain English.
-- Dashboards can't be deployed automatically yet: generate the dashboard YAML \
-in a ```yaml fence and give short numbered steps \
-(Settings > Dashboards > pencil icon > three-dot menu > Raw configuration editor).
+- When the user asks you to control something directly (turn on a light, set a \
+thermostat, change a select), use call_service. Common patterns: \
+light.turn_on, switch.turn_off, select.select_option (data: {"option": "..."}), \
+number.set_value (data: {"value": ...}), climate.set_temperature.
+- SAFETY: for entities related to power equipment — inverters, chargers, \
+batteries, solar (SolarAssistant), breakers, EVSE — state exactly what you are \
+about to change and ask the user to confirm BEFORE calling the service. Lights, \
+switches, media, climate comfort settings don't need confirmation.
+- When the user asks for a dashboard, build the Lovelace config and deploy it \
+with deploy_dashboard as a NEW dashboard (pick a sensible url_path). Only \
+overwrite an existing dashboard if the user explicitly confirms.
+- Use create_helper for input_boolean/number/select/text/datetime helpers, and \
+create_script for reusable scripts, when an automation needs them.
+- Wrap the exception: if a tool reports failure, tell the user plainly what \
+failed and what you'd try next — don't pretend it worked.
 
 Keep the tone friendly and plain-English. Confirm before creating anything \
 destructive or that replaces an existing automation."""
@@ -754,6 +767,71 @@ HA_TOOLS = [
         },
     },
     {
+        "name": "call_service",
+        "description": ("Call a Home Assistant service to control a device directly. "
+                        "domain + service (e.g. 'light'/'turn_on', 'select'/'select_option', "
+                        "'number'/'set_value'), the target entity_id, and optional service "
+                        "data (e.g. {'option': 'Solar first'} or {'value': 60})."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "Service domain, e.g. 'light', 'switch', 'select', 'number', 'climate'"},
+                "service": {"type": "string", "description": "Service name, e.g. 'turn_on', 'select_option', 'set_value'"},
+                "entity_id": {"type": "string"},
+                "data": {"type": "object", "description": "Optional extra service data"},
+            },
+            "required": ["domain", "service", "entity_id"],
+        },
+    },
+    {
+        "name": "deploy_dashboard",
+        "description": ("Create a NEW Lovelace dashboard on the user's Home Assistant and "
+                        "deploy the given config to it. Provide a unique snake_case url_path "
+                        "(becomes the sidebar URL), a human title, and the full dashboard "
+                        "config object ({'views': [...]}). NEVER use this to overwrite an "
+                        "existing dashboard unless the user explicitly confirms overwriting."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url_path": {"type": "string", "description": "snake_case path, e.g. 'solar_overview'. Must contain a hyphen or be simple lowercase; will be slugified."},
+                "title": {"type": "string", "description": "Sidebar title, e.g. 'Solar Overview'"},
+                "config": {"type": "object", "description": "Full dashboard config: {'views': [{'title':..., 'cards': [...]}]}"},
+                "overwrite_existing": {"type": "boolean", "description": "Set true ONLY if the user explicitly confirmed overwriting an existing dashboard with this url_path"},
+            },
+            "required": ["url_path", "title", "config"],
+        },
+    },
+    {
+        "name": "create_helper",
+        "description": ("Create a Home Assistant helper entity: input_boolean, input_number, "
+                        "input_select, input_text, or input_datetime. Config fields: name "
+                        "(required), icon, and type-specific fields (min/max/step for "
+                        "input_number, options for input_select, has_date/has_time for "
+                        "input_datetime)."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "helper_type": {"type": "string", "enum": ["input_boolean", "input_number", "input_select", "input_text", "input_datetime"]},
+                "config": {"type": "object", "description": "e.g. {'name': 'Vacation Mode', 'icon': 'mdi:beach'}"},
+            },
+            "required": ["helper_type", "config"],
+        },
+    },
+    {
+        "name": "create_script",
+        "description": ("Create (or overwrite) a reusable script on the user's Home Assistant. "
+                        "Provide a unique snake_case script_id and config with alias and "
+                        "sequence (list of actions)."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "script_id": {"type": "string", "description": "snake_case id, e.g. 'evening_shutdown'"},
+                "config": {"type": "object", "description": "Script config: {'alias':..., 'sequence': [...], 'mode': 'single'}"},
+            },
+            "required": ["script_id", "config"],
+        },
+    },
+    {
         "name": "create_automation",
         "description": ("Create (or overwrite) an automation on the user's Home Assistant. "
                         "Provide a unique snake_case automation_id and the automation config "
@@ -773,6 +851,35 @@ HA_TOOLS = [
 def _ha_headers(user):
     return {"Authorization": f"Bearer {decrypt_token(user.ha_token)}",
             "Content-Type": "application/json"}
+
+
+def ha_ws(user, commands):
+    """Run commands against HA's websocket API (dashboards, helpers live here,
+    not in REST). Takes a list of dicts, returns a list of result dicts."""
+    from websocket import create_connection
+    ws_url = user.ha_url.replace("https://", "wss://").replace("http://", "ws://") + "/api/websocket"
+    ws = create_connection(ws_url, timeout=15)
+    results = []
+    try:
+        json.loads(ws.recv())  # auth_required
+        ws.send(json.dumps({"type": "auth", "access_token": decrypt_token(user.ha_token)}))
+        auth = json.loads(ws.recv())
+        if auth.get("type") != "auth_ok":
+            raise RuntimeError(f"HA websocket auth failed: {auth}")
+        msg_id = 1
+        for cmd in commands:
+            payload = dict(cmd)
+            payload["id"] = msg_id
+            ws.send(json.dumps(payload))
+            while True:
+                resp = json.loads(ws.recv())
+                if resp.get("id") == msg_id and resp.get("type") == "result":
+                    results.append(resp)
+                    break
+            msg_id += 1
+    finally:
+        ws.close()
+    return results
 
 
 def run_ha_tool(user, name, tool_input):
@@ -805,6 +912,71 @@ def run_ha_tool(user, name, tool_input):
                 return f"Entity {eid} not found."
             r.raise_for_status()
             return str(r.json())
+
+        if name == "call_service":
+            domain = (tool_input.get("domain") or "").strip()
+            service = (tool_input.get("service") or "").strip()
+            eid = (tool_input.get("entity_id") or "").strip()
+            if not domain or not service or not eid:
+                return "Error: domain, service, and entity_id are all required."
+            payload = dict(tool_input.get("data") or {})
+            payload["entity_id"] = eid
+            r = requests.post(f"{base}/api/services/{domain}/{service}",
+                              headers=_ha_headers(user), json=payload, timeout=15)
+            if r.status_code == 200:
+                return f"Called {domain}.{service} on {eid} successfully."
+            return f"Home Assistant rejected the call (HTTP {r.status_code}): {r.text[:300]}"
+
+        if name == "deploy_dashboard":
+            url_path = (tool_input.get("url_path") or "").strip().lower().replace("_", "-")
+            title = (tool_input.get("title") or url_path).strip()
+            config = tool_input.get("config") or {}
+            if not url_path or not config.get("views"):
+                return "Error: url_path and a config with 'views' are required."
+            if "-" not in url_path:
+                url_path = "ha-" + url_path  # HA requires a hyphen in dashboard url paths
+            existing = ha_ws(user, [{"type": "lovelace/dashboards/list"}])[0]
+            boards = {d.get("url_path"): d for d in (existing.get("result") or [])}
+            if url_path in boards and not tool_input.get("overwrite_existing"):
+                return (f"A dashboard with url_path '{url_path}' already exists. Ask the user "
+                        "whether to overwrite it, or pick a different url_path.")
+            cmds = []
+            if url_path not in boards:
+                cmds.append({"type": "lovelace/dashboards/create", "url_path": url_path,
+                             "title": title, "mode": "storage", "show_in_sidebar": True})
+            cmds.append({"type": "lovelace/config/save", "url_path": url_path, "config": config})
+            results = ha_ws(user, cmds)
+            failed = [r for r in results if not r.get("success")]
+            if failed:
+                return f"Dashboard deploy failed: {failed[0].get('error')}"
+            return (f"Dashboard '{title}' deployed. It's in the sidebar now at /{url_path} — "
+                    "tell the user to refresh their Home Assistant page.")
+
+        if name == "create_helper":
+            htype = (tool_input.get("helper_type") or "").strip()
+            config = dict(tool_input.get("config") or {})
+            if htype not in ("input_boolean", "input_number", "input_select", "input_text", "input_datetime"):
+                return "Error: unsupported helper_type."
+            if not config.get("name"):
+                return "Error: config.name is required."
+            r = ha_ws(user, [{"type": f"{htype}/create", **config}])[0]
+            if r.get("success"):
+                return f"Helper created: {htype}.{r.get('result', {}).get('id', config['name'])}"
+            return f"Helper creation failed: {r.get('error')}"
+
+        if name == "create_script":
+            sid = (tool_input.get("script_id") or "").strip()
+            config = tool_input.get("config") or {}
+            if not sid or not config.get("sequence"):
+                return "Error: script_id and config with a 'sequence' are required."
+            config.setdefault("alias", sid.replace("_", " ").title())
+            r = requests.post(f"{base}/api/config/script/config/{sid}",
+                              headers=_ha_headers(user), json=config, timeout=15)
+            if r.status_code in (200, 201):
+                requests.post(f"{base}/api/services/script/reload",
+                              headers=_ha_headers(user), timeout=10)
+                return f"Script '{sid}' created and loaded. Callable as script.{sid}."
+            return f"Home Assistant rejected the script (HTTP {r.status_code}): {r.text[:300]}"
 
         if name == "create_automation":
             aid = tool_input.get("automation_id", "").strip()

@@ -227,6 +227,11 @@ main { max-width: 860px; margin: 0 auto; padding: 24px 16px 60px; }
 .chat-row textarea { resize: none; height: 52px; }
 .chat-row button { margin: 0; white-space: nowrap; }
 #mic-btn { background: var(--panel2); border: 1px solid var(--line); font-size: 18px; }
+#attach-btn { background: var(--panel2); border: 1px solid var(--line); font-size: 18px; }
+.msg img.chat-img, #pending-imgs img { max-width: 180px; max-height: 140px; border-radius: 8px;
+  border: 1px solid var(--line); display: block; margin: 6px 0; }
+.msg img.svg-render { max-width: 100%; max-height: 420px; background: #fff; border-radius: 8px;
+  border: 1px solid var(--line); display: block; margin: 8px 0; }
 #mic-btn.listening { background: var(--err); animation: pulse 1.2s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
 @media (prefers-reduced-motion: reduce) { #mic-btn.listening { animation: none; } }
@@ -268,8 +273,11 @@ details summary { cursor: pointer; color: var(--dim); font-size: 14px; }
 
 Try: "Build me a dashboard for my living room lights and thermostat."</div>
   </div>
+  <div id="pending-imgs" style="display:flex;gap:8px;margin-bottom:8px;"></div>
   <div class="chat-row">
     <textarea id="chat-input" placeholder="Describe what you want..."></textarea>
+    <input type="file" id="img-input" accept="image/*" multiple style="display:none;" onchange="imagesPicked(this.files)">
+    <button onclick="document.getElementById('img-input').click()" id="attach-btn" title="Attach a photo, sketch, or satellite image">&#128247;</button>
     <button onclick="toggleVoice()" id="mic-btn" title="Speak instead of typing">&#127908;</button>
     <button onclick="sendMsg()" id="send-btn">Send</button>
   </div>
@@ -283,18 +291,55 @@ Try: "Build me a dashboard for my living room lights and thermostat."</div>
 
 <script>
 const history = [];
+let pendingImages = [];
 
-function addMsg(text, who) {
+function imagesPicked(files) {
+  for (const f of files) {
+    const img = new Image();
+    const url = URL.createObjectURL(f);
+    img.onload = () => {
+      // Downscale to max 1400px so satellite shots don't blow up the request.
+      const scale = Math.min(1, 1400 / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale);
+      c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      const dataUrl = c.toDataURL('image/jpeg', 0.85);
+      pendingImages.push(dataUrl.split(',')[1]);
+      const t = document.createElement('img');
+      t.src = dataUrl;
+      document.getElementById('pending-imgs').appendChild(t);
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  }
+  document.getElementById('img-input').value = '';
+}
+
+function addMsg(text, who, images) {
   const box = document.getElementById('chat-box');
   const div = document.createElement('div');
   div.className = 'msg ' + who;
   // Render fenced code blocks as <pre>, escape everything else.
   const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  const parts = text.split(/```(?:yaml|json|python)?\\n?/);
+  const parts = text.split(/```(svg|yaml|json|python|xml|html)?\\n?/);
   let html = '';
-  parts.forEach((p, i) => {
-    html += (i % 2 === 1) ? '<pre>' + esc(p) + '</pre>' : esc(p);
-  });
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 3 === 0) { html += esc(parts[i]); continue; }
+    if (i % 3 === 1) {
+      const lang = parts[i], body = parts[i+1] || '';
+      const trimmed = body.trim();
+      if ((lang === 'svg' || trimmed.startsWith('<svg')) && trimmed.startsWith('<svg')) {
+        // Render drawings as an image (data URI = no script execution).
+        html += '<img class="svg-render" src="data:image/svg+xml;base64,' +
+                btoa(unescape(encodeURIComponent(trimmed))) + '">';
+      } else {
+        html += '<pre>' + esc(body) + '</pre>';
+      }
+      i++; // skip the body slot we just consumed
+    }
+  }
+  if (images) for (const b64 of images) html += '<img class="chat-img" src="data:image/jpeg;base64,' + b64 + '">';
   div.innerHTML = html;
   box.appendChild(div);
   box.scrollTop = box.scrollHeight;
@@ -304,10 +349,19 @@ async function sendMsg() {
   const input = document.getElementById('chat-input');
   const btn = document.getElementById('send-btn');
   const text = input.value.trim();
-  if (!text) return;
+  if (!text && pendingImages.length === 0) return;
   if (window.speechSynthesis) speechSynthesis.cancel();
-  addMsg(text, 'user');
-  history.push({role: 'user', content: text});
+  const imgs = pendingImages;
+  pendingImages = [];
+  document.getElementById('pending-imgs').innerHTML = '';
+  addMsg(text, 'user', imgs);
+  if (imgs.length) {
+    const blocks = imgs.map(b64 => ({type:'image', source:{type:'base64', media_type:'image/jpeg', data:b64}}));
+    blocks.push({type:'text', text: text || 'Here is the image.'});
+    history.push({role: 'user', content: blocks});
+  } else {
+    history.push({role: 'user', content: text});
+  }
   input.value = '';
   btn.disabled = true;
   btn.textContent = '...';
@@ -382,7 +436,7 @@ function speak(text) {
   if (!voiceOn() || !window.speechSynthesis) return;
   // Don't read code blocks aloud; mention them instead.
   const spoken = text
-    .split(/```[\\s\\S]*?```/).join(' ... the config is in the chat ... ')
+    .split(/```[\\s\\S]*?```/).join(' ... it's in the chat ... ')
     .replace(/[*#`_]/g, '')
     .replace(/\\[Actions taken:.*?\\]/g, '')
     .trim();
@@ -740,6 +794,16 @@ create_script for reusable scripts, when an automation needs them.
 - Wrap the exception: if a tool reports failure, tell the user plainly what \
 failed and what you'd try next — don't pretend it worked.
 
+- FLOOR PLANS: when the user sends a satellite image, photo, or hand-drawn \
+sketch of a building, you can draft a proportionally scaled floor plan. Ask for \
+ONE known reference dimension if none was given (e.g. "how wide is the garage \
+door?"). Output the plan as clean SVG in a ```svg fence: white background, \
+dark wall lines (walls ~6in thick at scale), label rooms, mark doors as arcs \
+with standard widths (28/30/32/34/36 inch), windows as double lines, and put \
+an overall dimension along two edges. Include a data-scale attribute on the \
+svg root (pixels per foot). Iterate on the drawing when the user corrects it — \
+always re-output the FULL updated SVG.
+
 Keep the tone friendly and plain-English. Confirm before creating anything \
 destructive or that replaces an existing automation."""
 
@@ -1016,7 +1080,7 @@ def chat():
         for _ in range(6):  # allow up to 6 tool round-trips per user message
             resp = client.messages.create(
                 model="claude-sonnet-4-6",
-                max_tokens=2500,
+                max_tokens=4500,
                 system=SYSTEM_PROMPT,
                 tools=HA_TOOLS,
                 messages=convo,
